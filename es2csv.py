@@ -14,12 +14,14 @@ usage:           es2csv -q '*' -i _all -e -o ~/file.csv -k -m 100
 import os
 import sys
 import time
+from operator import itemgetter
 import argparse
 import json
 import csv
 import elasticsearch
 import progressbar
 from functools import wraps
+from datetime import datetime
 
 FLUSH_BUFFER = 1000  # Chunk of docs to flush in temp file
 CONNECTION_TIMEOUT = 120
@@ -58,231 +60,145 @@ def retry(ExceptionToCheck, tries=TIMES_TO_TRY, delay=RETRY_DELAY):
 
 class Es2csv:
 
-    def __init__(self, opts):
-        self.opts = opts
-
+    def __init__(self, index='*', host='91.235.136.166', port=9200, ):
+        self.host = host
+        self.port = port
+        self.index = index
         self.num_results = 0
         self.scroll_ids = []
         self.scroll_time = '30m'
 
-        self.csv_headers = list(META_FIELDS) if self.opts.meta_fields else []
-        self.tmp_file = '%s.tmp' % opts.output_file
+        # self.csv_headers = list(META_FIELDS) if self.opts.meta_fields else []
+        # self.tmp_file = '%s.tmp' % opts.output_file
 
     @retry(elasticsearch.exceptions.ConnectionError, tries=TIMES_TO_TRY)
     def create_connection(self):
-        es = elasticsearch.Elasticsearch(self.opts.url, timeout=CONNECTION_TIMEOUT, http_auth=self.opts.auth, verify_certs=self.opts.verify_certs, ca_certs=self.opts.ca_certs, client_cert=self.opts.client_cert, client_key=self.opts.client_key)
+        es = elasticsearch.Elasticsearch(self.host, timeout=CONNECTION_TIMEOUT)
         es.cluster.health()
-        self.es_conn = es
+        self.es = es
 
     @retry(elasticsearch.exceptions.ConnectionError, tries=TIMES_TO_TRY)
     def check_indexes(self):
-        indexes = self.opts.index_prefixes
-        if '_all' in indexes:
-            indexes = ['_all']
-        else:
-            indexes = [index for index in indexes if self.es_conn.indices.exists(index)]
-            if not indexes:
-                print('Any of index(es) %s does not exist in %s.' % (', '.join(self.opts.index_prefixes), self.opts.url))
-                exit(1)
-        self.opts.index_prefixes = indexes
+        indexes = self.es.indices.get_alias(self.index)
 
-    @retry(elasticsearch.exceptions.ConnectionError, tries=TIMES_TO_TRY)
-    def search_query(self):
-        @retry(elasticsearch.exceptions.ConnectionError, tries=TIMES_TO_TRY)
-        def next_scroll(scroll_id):
-            return self.es_conn.scroll(scroll=self.scroll_time, scroll_id=scroll_id)
-        search_args = dict(
-            index=','.join(self.opts.index_prefixes),
+        for index in indexes:
+            self.dump_index(index)
+
+    def dump_index(self, index):
+        page = self.es.search(
+            index=index,
             scroll=self.scroll_time,
-            size=self.opts.scroll_size,
-            terminate_after=self.opts.max_results
+            size=1000,
+            body={
+                "query": {
+                    "match_all": {}
+                }
+            },
+            sort='_id'
         )
+        sid = page['_scroll_id']
+        scrolled = len(page['hits']['hits'])
+        scroll_size = page['hits']['total']
 
-        if self.opts.doc_types:
-            search_args['doc_type'] = self.opts.doc_types
+        widgets = ['Exporting {index}'.format(index=str(index)),
+                   progressbar.Bar(left='[', marker='#', right=']'),
+                   progressbar.FormatLabel(' [%(value)i/%(max)i] ['),
+                   progressbar.Percentage(),
+                   progressbar.FormatLabel('] [%(elapsed)s] ['),
+                   progressbar.ETA(), '] [',
+                   progressbar.FileTransferSpeed(unit='docs'), ']'
+                   ]
+        bar = progressbar.ProgressBar(widgets=widgets, maxval=scroll_size).start()
+        bar.update(scrolled)
 
-        if self.opts.query.startswith('@'):
-            query_file = self.opts.query[1:]
-            if os.path.exists(query_file):
-                with open(query_file, 'r') as f:
-                    self.opts.query = f.read()
-            else:
-                print('No such file: %s' % query_file)
-                exit(1)
-        if self.opts.raw_query:
-            try:
-                query = json.loads(self.opts.query)
-            except ValueError as e:
-                print('Invalid JSON syntax in query. %s' % e)
-                exit(1)
-            search_args['body'] = query
-        else:
-            query = self.opts.query if not self.opts.tags else '%s AND tags:%s' % (
-                self.opts.query, '(%s)' % ' AND '.join(self.opts.tags))
-            search_args['q'] = query
+        if self.prepare_file(index, page['hits']['hits']) is None:
+            return
 
-        if '_all' not in self.opts.fields:
-            search_args['_source_include'] = ','.join(self.opts.fields)
-            self.csv_headers.extend([field for field in self.opts.fields if '*' not in field])
+        self.write_to_file(page['hits']['hits'])
 
-        if self.opts.debug_mode:
-            print('Using these indices: %s' % ', '.join(self.opts.index_prefixes))
-            print('Query[%s]: %s' % (('Query DSL', json.dumps(query)) if self.opts.raw_query else ('Lucene', query)))
-            print('Output field(s): %s' % ', '.join(self.opts.fields))
+        while (scrolled < scroll_size):
+            # print ("Scrolling...")
+            page = self.es.scroll(scroll_id=sid, scroll=self.scroll_time)
+            # Update the scroll ID
+            sid = page['_scroll_id']
+            # Get the number of results that we returned in the last scroll
+            scrolled += len(page['hits']['hits'])
+            bar.update(scrolled)
 
-        res = self.es_conn.search(**search_args)
+            self.write_to_file(page['hits']['hits'])
 
-        self.num_results = res['hits']['total']
+    def prepare_file(self, index, data, type='json'):
 
-        print('Found %s results' % self.num_results)
-        if self.opts.debug_mode:
-            print(json.dumps(res))
+        if len(data) == 0:
+            return None
 
-        if self.num_results > 0:
-            open(self.opts.output_file, 'w').close()
-            open(self.tmp_file, 'w').close()
+        self.filename = '{index}_{time}.{type}'.format(index=index.replace('.', '_'),
+                                                       time=datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
+                                                       type=type)
+        file = open(self.filename, 'w')
 
-            hit_list = []
-            total_lines = 0
-
-            widgets = ['Run query ',
-                       progressbar.Bar(left='[', marker='#', right=']'),
-                       progressbar.FormatLabel(' [%(value)i/%(max)i] ['),
-                       progressbar.Percentage(),
-                       progressbar.FormatLabel('] [%(elapsed)s] ['),
-                       progressbar.ETA(), '] [',
-                       progressbar.FileTransferSpeed(unit='docs'), ']'
-                       ]
-            bar = progressbar.ProgressBar(widgets=widgets, maxval=self.num_results).start()
-
-            while total_lines != self.num_results:
-                if res['_scroll_id'] not in self.scroll_ids:
-                    self.scroll_ids.append(res['_scroll_id'])
-
-                if not res['hits']['hits']:
-                    print('Scroll[%s] expired(multiple reads?). Saving loaded data.' % res['_scroll_id'])
-                    break
-                for hit in res['hits']['hits']:
-                    total_lines += 1
-                    bar.update(total_lines)
-                    hit_list.append(hit)
-                    if len(hit_list) == FLUSH_BUFFER:
-                        self.flush_to_file(hit_list)
-                        hit_list = []
-                    if self.opts.max_results:
-                        if total_lines == self.opts.max_results:
-                            self.flush_to_file(hit_list)
-                            print('Hit max result limit: %s records' % self.opts.max_results)
-                            return
-                res = next_scroll(res['_scroll_id'])
-            self.flush_to_file(hit_list)
-            bar.finish()
-
-    def flush_to_file(self, hit_list):
-        def to_keyvalue_pairs(source, ancestors=[], header_delimeter='.'):
-            def is_list(arg):
-                return type(arg) is list
-
-            def is_dict(arg):
-                return type(arg) is dict
-
-            if is_dict(source):
-                for key in source.keys():
-                    to_keyvalue_pairs(source[key], ancestors + [key])
-
-            elif is_list(source):
-                if self.opts.kibana_nested:
-                    [to_keyvalue_pairs(item, ancestors) for item in source]
-                else:
-                    [to_keyvalue_pairs(item, ancestors + [str(index)]) for index, item in enumerate(source)]
-            else:
-                header = header_delimeter.join(ancestors)
-                if header not in self.csv_headers:
-                    self.csv_headers.append(header)
-                try:
-                    out[header] = '%s%s%s' % (out[header], self.opts.delimiter, source)
-                except:
-                    out[header] = source
-
-        with open(self.tmp_file, 'a') as tmp_file:
-            for hit in hit_list:
-                out = {field: hit[field] for field in META_FIELDS} if self.opts.meta_fields else {}
-                if '_source' in hit and len(hit['_source']) > 0:
-                    to_keyvalue_pairs(hit['_source'])
-                    tmp_file.write('%s\n' % json.dumps(out))
-        tmp_file.close()
-
-    def write_to_csv(self):
-        if self.num_results > 0:
-            self.num_results = sum(1 for line in open(self.tmp_file, 'r'))
-            if self.num_results > 0:
-                output_file = open(self.opts.output_file, 'a')
-                csv_writer = csv.DictWriter(output_file, fieldnames=self.csv_headers, delimiter=self.opts.delimiter)
-                csv_writer.writeheader()
-                timer = 0
-                widgets = ['Write to csv ',
-                           progressbar.Bar(left='[', marker='#', right=']'),
-                           progressbar.FormatLabel(' [%(value)i/%(max)i] ['),
-                           progressbar.Percentage(),
-                           progressbar.FormatLabel('] [%(elapsed)s] ['),
-                           progressbar.ETA(), '] [',
-                           progressbar.FileTransferSpeed(unit='lines'), ']'
-                           ]
-                bar = progressbar.ProgressBar(widgets=widgets, maxval=self.num_results).start()
-
-                for line in open(self.tmp_file, 'r'):
-                    timer += 1
-                    bar.update(timer)
-                    line_as_dict = json.loads(line)
-                    line_dict_utf8 = {k: v.encode('utf8') if isinstance(v, unicode) else v for k, v in line_as_dict.items()}
-                    csv_writer.writerow(line_dict_utf8)
-                output_file.close()
-                bar.finish()
-            else:
-                print('There is no docs with selected field(s): %s.' % ','.join(self.opts.fields))
-            os.remove(self.tmp_file)
-
-    def clean_scroll_ids(self):
-        try:
-            self.es_conn.clear_scroll(body=','.join(self.scroll_ids))
-        except:
+        if type == 'json':
             pass
+
+        if type == 'csv':
+            self.csv_headers = get_headers(data[0]['_source'])
+            file.write(','.join(self.csv_headers))
+
+        self.file_type = type
+
+        file.close()
+        return 1
+
+    def write_to_file(self, data):
+
+        if self.file_type == 'json':
+            with open(self.filename, 'a') as file:
+                for hit in data:
+                    file.write(json.dumps(hit['_source'])+'\n')
+                file.close()
+
+        if self.file_type == 'csv':
+            self.csv_headers = []
+
+            def to_keyvalue_pairs(source, ancestors=[], header_delimeter=','):
+                def is_list(arg):
+                    return type(arg) is list
+
+                def is_dict(arg):
+                    return type(arg) is dict
+
+                if is_dict(source):
+                    for key in source.keys():
+                        to_keyvalue_pairs(source[key], ancestors + [key])
+
+                elif is_list(source):
+                    # if self.opts.kibana_nested:
+                    [to_keyvalue_pairs(item, ancestors) for item in source]
+                    # else:
+                    #     [to_keyvalue_pairs(item, ancestors + [str(index)]) for index, item in enumerate(source)]
+                else:
+                    header = header_delimeter.join(ancestors)
+                    if header not in self.csv_headers:
+                        self.csv_headers.append(header)
+                    try:
+                        out[header] = '%s%s%s' % (out[header], ',', source)
+                    except:
+                        out[header] = source
+
+            with open(self.filename, 'a') as tmp_file:
+                for hit in data:
+                    out = {}
+                    if '_source' in hit and len(hit['_source']) > 0:
+                        to_keyvalue_pairs(hit['_source'])
+                        tmp_file.write('%s\n' % json.dumps(out))
+                tmp_file.close()
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('-q', '--query', dest='query', type=str, required=True, help='Query string in Lucene syntax.')
-    p.add_argument('-u', '--url', dest='url', default='http://localhost:9200', type=str, help='Elasticsearch host URL. Default is %(default)s.')
-    p.add_argument('-a', '--auth', dest='auth', type=str, required=False, help='Elasticsearch basic authentication in the form of username:password.')
-    p.add_argument('-i', '--index-prefixes', dest='index_prefixes', default=['logstash-*'], type=str, nargs='+', metavar='INDEX', help='Index name prefix(es). Default is %(default)s.')
-    p.add_argument('-D', '--doc_types', dest='doc_types', type=str, nargs='+', metavar='DOC_TYPE', help='Document type(s).')
-    p.add_argument('-t', '--tags', dest='tags', type=str, nargs='+', help='Query tags.')
-    p.add_argument('-o', '--output_file', dest='output_file', type=str, required=True, metavar='FILE', help='CSV file location.')
-    p.add_argument('-f', '--fields', dest='fields', default=['_all'], type=str, nargs='+', help='List of selected fields in output. Default is %(default)s.')
-    p.add_argument('-d', '--delimiter', dest='delimiter', default=',', type=str, help='Delimiter to use in CSV file. Default is "%(default)s".')
-    p.add_argument('-m', '--max', dest='max_results', default=0, type=int, metavar='INTEGER', help='Maximum number of results to return. Default is %(default)s.')
-    p.add_argument('-s', '--scroll_size', dest='scroll_size', default=100, type=int, metavar='INTEGER', help='Scroll size for each batch of results. Default is %(default)s.')
-    p.add_argument('-k', '--kibana_nested', dest='kibana_nested', action='store_true', help='Format nested fields in Kibana style.')
-    p.add_argument('-r', '--raw_query', dest='raw_query', action='store_true', help='Switch query format in the Query DSL.')
-    p.add_argument('-e', '--meta_fields', dest='meta_fields', action='store_true', help='Add meta-fields in output.')
-    p.add_argument('--verify-certs', dest='verify_certs', action='store_true', help='Verify SSL certificates. Default is %(default)s.')
-    p.add_argument('--ca-certs', dest='ca_certs', default=None, type=str, help='Location of CA bundle.')
-    p.add_argument('--client-cert', dest='client_cert', default=None, type=str, help='Location of Client Auth cert.')
-    p.add_argument('--client-key', dest='client_key', default=None, type=str, help='Location of Client Cert Key.')
-    p.add_argument('-v', '--version', action='version', version='%(prog)s ' + __version__, help='Show version and exit.')
-    p.add_argument('--debug', dest='debug_mode', action='store_true', help='Debug mode on.')
 
-    if len(sys.argv) == 1:
-        p.print_help()
-        exit()
-
-    opts = p.parse_args()
-    es = Es2csv(opts)
+    es = Es2csv(index='usdbch.kraken.*')
     es.create_connection()
     es.check_indexes()
-    es.search_query()
-    es.write_to_csv()
-    es.clean_scroll_ids()
 
 if __name__ == '__main__':
     main()
